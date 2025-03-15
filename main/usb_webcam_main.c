@@ -15,18 +15,6 @@
 #include "esp_camera.h"
 #include "usb_device_uvc.h"
 #include "uvc_frame_config.h"
-#if CONFIG_CAMERA_MODULE_ESP_S3_EYE
-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
-#include "freertos/event_groups.h"
-#include "bsp/esp-bsp.h"
-#include "show_eyes.h"
-static EventGroupHandle_t s_event_group = NULL;
-#define EYES_CLOSE_BIT BIT0
-#define EYES_OPEN_BIT  BIT1
-#else
-#pragma message("ESP-S3-EYE lcd animation not supported in ESP-IDF < v5.0")
-#endif
-#endif
 
 static const char *TAG = "usb_webcam";
 
@@ -39,12 +27,36 @@ static const char *TAG = "usb_webcam";
 #define UVC_MAX_FRAMESIZE_SIZE     (60*1024)
 #endif
 
+// Format name mapping for logging
+static const char *uvc_format_names[] = {
+    "UNKNOWN",
+    "MJPEG",
+    "YUY2",
+    "NV12",
+    "GRAY8"
+};
+
 typedef struct {
     camera_fb_t *cam_fb_p;
     uvc_fb_t uvc_fb;
 } fb_t;
 
 static fb_t s_fb;
+
+// Current negotiated UVC parameters
+static struct {
+    uvc_format_t format;
+    int width;
+    int height;
+    int frame_rate;
+    uint32_t frame_interval; // in 100-ns units
+} s_uvc_params = {
+    .format = UVC_FORMAT_MJPEG,
+    .width = 640,
+    .height = 480,
+    .frame_rate = 30,
+    .frame_interval = 333333
+};
 
 static esp_err_t camera_init(uint32_t xclk_freq_hz, pixformat_t pixel_format, framesize_t frame_size, int jpeg_quality, uint8_t fb_count)
 {
@@ -109,6 +121,7 @@ static esp_err_t camera_init(uint32_t xclk_freq_hz, pixformat_t pixel_format, fr
     // If you need to reset the appeal parameters, please reinitialize the sensor.
     sensor_t *s = esp_camera_sensor_get();
     s->set_vflip(s, 1); // flip it back
+    
     // initial sensors are flipped vertically and colors are a bit saturated
     if (s->id.PID == OV3660_PID) {
         s->set_brightness(s, 1); // up the blightness just a bit
@@ -125,6 +138,7 @@ static esp_err_t camera_init(uint32_t xclk_freq_hz, pixformat_t pixel_format, fr
 
     // Get the basic information of the sensor.
     camera_sensor_info_t *s_info = esp_camera_sensor_get_info(&(s->id));
+    ESP_LOGI(TAG, "Camera sensor: %s (PID: 0x%x)", s_info->name, s->id.PID);
 
     if (ESP_OK == ret && PIXFORMAT_JPEG == pixel_format && s_info->support_jpeg == true) {
         cur_xclk_freq_hz = xclk_freq_hz;
@@ -144,27 +158,36 @@ static esp_err_t camera_init(uint32_t xclk_freq_hz, pixformat_t pixel_format, fr
 static void camera_stop_cb(void *cb_ctx)
 {
     (void)cb_ctx;
-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
-#if CONFIG_CAMERA_MODULE_ESP_S3_EYE
-    xEventGroupSetBits(s_event_group, EYES_CLOSE_BIT);
-#endif
-#endif
     ESP_LOGI(TAG, "Camera Stop");
 }
 
 static esp_err_t camera_start_cb(uvc_format_t format, int width, int height, int rate, void *cb_ctx)
 {
     (void)cb_ctx;
-    ESP_LOGI(TAG, "Camera Start");
-    ESP_LOGI(TAG, "Format: %d, width: %d, height: %d, rate: %d", format, width, height, rate);
+    ESP_LOGI(TAG, "========== UVC Negotiation Parameters ==========");
+    ESP_LOGI(TAG, "Format: %s (%d)", format < sizeof(uvc_format_names)/sizeof(uvc_format_names[0]) ? 
+                                      uvc_format_names[format] : "UNKNOWN", format);
+    ESP_LOGI(TAG, "Resolution: %dx%d", width, height);
+    ESP_LOGI(TAG, "Frame Rate: %d fps", rate);
+    ESP_LOGI(TAG, "Frame Interval: %d (100ns units)", 10000000 / rate);
+    ESP_LOGI(TAG, "================================================");
+    
+    // Store the negotiated parameters
+    s_uvc_params.format = format;
+    s_uvc_params.width = width;
+    s_uvc_params.height = height;
+    s_uvc_params.frame_rate = rate;
+    s_uvc_params.frame_interval = 10000000 / rate;
+    
     framesize_t frame_size = FRAMESIZE_QVGA;
     int jpeg_quality = 14;
 
-    if (format != UVC_FORMAT_JPEG) {
+    if (format != UVC_FORMAT_MJPEG) {
         ESP_LOGE(TAG, "Only support MJPEG format");
         return ESP_ERR_NOT_SUPPORTED;
     }
 
+    // Map resolution to camera frame size
     if (width == 320 && height == 240) {
         frame_size = FRAMESIZE_QVGA;
         jpeg_quality = 10;
@@ -188,17 +211,15 @@ static esp_err_t camera_start_cb(uvc_format_t format, int width, int height, int
         return ESP_ERR_NOT_SUPPORTED;
     }
 
+    ESP_LOGI(TAG, "Initializing camera with %s format, %dx%d resolution, quality %d", 
+             format == UVC_FORMAT_MJPEG ? "MJPEG" : "OTHER", width, height, jpeg_quality);
+             
     esp_err_t ret = camera_init(CAMERA_XCLK_FREQ, PIXFORMAT_JPEG, frame_size, jpeg_quality, CAMERA_FB_COUNT);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "camera init failed");
+        ESP_LOGE(TAG, "Camera init failed: %s", esp_err_to_name(ret));
         return ret;
     }
 
-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
-#if CONFIG_CAMERA_MODULE_ESP_S3_EYE
-    xEventGroupSetBits(s_event_group, EYES_OPEN_BIT);
-#endif
-#endif
     return ESP_OK;
 }
 
@@ -233,18 +254,6 @@ static void camera_fb_return_cb(uvc_fb_t *fb, void *cb_ctx)
 
 void app_main(void)
 {
-    // if using esp-s3-eye board, show the GUI
-#if CONFIG_CAMERA_MODULE_ESP_S3_EYE
-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
-    bsp_display_start();
-    bsp_display_backlight_on();
-    lv_obj_t* img = eyes_init();
-    s_event_group = xEventGroupCreate();
-    xEventGroupSetBits(s_event_group, EYES_CLOSE_BIT);
-#else
-    ESP_LOGW(TAG, "ESP-S3-EYE lcd animation not supported in ESP-IDF < v5.0");
-#endif
-#endif
     ESP_LOGI(TAG, "Selected Camera Board %s", CAMERA_MODULE_NAME);
     uint8_t *uvc_buffer = (uint8_t *)malloc(UVC_MAX_FRAMESIZE_SIZE);
     if (uvc_buffer == NULL) {
@@ -261,55 +270,32 @@ void app_main(void)
         .stop_cb = camera_stop_cb,
     };
 
+    ESP_LOGI(TAG, "====== UVC Configuration Information ======");
     ESP_LOGI(TAG, "Format List");
     ESP_LOGI(TAG, "\tFormat(1) = %s", "MJPEG");
+    
     ESP_LOGI(TAG, "Frame List");
-    ESP_LOGI(TAG, "\tFrame(1) = %d * %d @%dfps", UVC_FRAMES_INFO[0][0].width, UVC_FRAMES_INFO[0][0].height, UVC_FRAMES_INFO[0][0].rate);
-#if CONFIG_CAMERA_MULTI_FRAMESIZE
-    ESP_LOGI(TAG, "\tFrame(2) = %d * %d @%dfps", UVC_FRAMES_INFO[0][1].width, UVC_FRAMES_INFO[0][1].height, UVC_FRAMES_INFO[0][1].rate);
-    ESP_LOGI(TAG, "\tFrame(3) = %d * %d @%dfps", UVC_FRAMES_INFO[0][2].width, UVC_FRAMES_INFO[0][2].height, UVC_FRAMES_INFO[0][2].rate);
-    ESP_LOGI(TAG, "\tFrame(3) = %d * %d @%dfps", UVC_FRAMES_INFO[0][3].width, UVC_FRAMES_INFO[0][3].height, UVC_FRAMES_INFO[0][3].rate);
-#endif
+    ESP_LOGI(TAG, "\tFrame(1) = %d * %d @%dfps (interval: %d)",
+             UVC_FRAMES_INFO[0][0].width, UVC_FRAMES_INFO[0][0].height,
+             UVC_FRAMES_INFO[0][0].rate, UVC_FRAMES_INFO[0][0].interval);
+    ESP_LOGI(TAG, "\tFrame(2) = %d * %d @%dfps (interval: %d)",
+             UVC_FRAMES_INFO[0][1].width, UVC_FRAMES_INFO[0][1].height,
+             UVC_FRAMES_INFO[0][1].rate, UVC_FRAMES_INFO[0][1].interval);
+    ESP_LOGI(TAG, "\tFrame(3) = %d * %d @%dfps (interval: %d)",
+             UVC_FRAMES_INFO[0][2].width, UVC_FRAMES_INFO[0][2].height,
+             UVC_FRAMES_INFO[0][2].rate, UVC_FRAMES_INFO[0][2].interval);
+    ESP_LOGI(TAG, "\tFrame(4) = %d * %d @%dfps (interval: %d)",
+             UVC_FRAMES_INFO[0][3].width, UVC_FRAMES_INFO[0][3].height,
+             UVC_FRAMES_INFO[0][3].rate, UVC_FRAMES_INFO[0][3].interval);
+    ESP_LOGI(TAG, "===========================================");
 
     ESP_ERROR_CHECK(uvc_device_config(0, &config));
     ESP_ERROR_CHECK(uvc_device_init());
 
+    ESP_LOGI(TAG, "UVC device initialized. Waiting for USB host connection...");
+
+    // Main loop - just wait for callbacks
     while (1) {
-#if CONFIG_CAMERA_MODULE_ESP_S3_EYE
-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
-        static uint32_t close_time_ms = 0;
-        static uint32_t open_time_ms = 0;
-        EventBits_t bits = xEventGroupWaitBits(s_event_group, EYES_CLOSE_BIT | EYES_OPEN_BIT, pdTRUE, pdFALSE, pdMS_TO_TICKS(10));
-        if (bits & EYES_CLOSE_BIT) {
-            eyes_close(img);
-            close_time_ms = 10;
-            open_time_ms = 0;
-            ESP_LOGI(TAG, "EYES CLOSE");
-        } else if (bits & EYES_OPEN_BIT) {
-            eyes_open(img);
-            close_time_ms = 0;
-            open_time_ms = 10;
-            ESP_LOGI(TAG, "EYES OPEN");
-        } else if (open_time_ms) {
-            open_time_ms += 10;
-            if (open_time_ms > 1000) {
-                open_time_ms = 0;
-                eyes_blink(img);
-                ESP_LOGI(TAG, "EYES BLINK");
-            }
-        } else if (close_time_ms) {
-            close_time_ms += 10;
-            if (close_time_ms > 1000) {
-                close_time_ms = 0;
-                eyes_static(img);
-                ESP_LOGI(TAG, "EYES STATIC");
-            }
-        }
-#else
         vTaskDelay(pdMS_TO_TICKS(100));
-#endif
-#else
-        vTaskDelay(pdMS_TO_TICKS(100));
-#endif
     }
 }
