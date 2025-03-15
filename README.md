@@ -8,6 +8,17 @@ This example demonstrates how to use ESP32-Sx USB function as the USB Web Camera
 
 ![esp32_s3_eye_webcam](https://dl.espressif.com/AE/esp-dev-kits/webcam.gif)
 
+## Hackerspaces: Innovation Through Collaboration
+
+This project thrives in hackerspace environments where creativity and collaborative learning accelerate development. Hackerspaces provide:
+
+* Access to shared tools, equipment, and expertise
+* Community-driven troubleshooting and problem-solving
+* Open exchange of ideas across diverse skill sets
+* Opportunities for cross-disciplinary innovation
+
+Hackerspaces democratize technology, making projects like this more accessible to everyone regardless of background or resources. They're the perfect environments for experimenting with hardware like the ESP32 camera modules used in this project.
+
 ### Try the example through the esp-launchpad
 
 <a href="https://espressif.github.io/esp-launchpad/?flashConfigURL=https://raw.githubusercontent.com/espressif/esp-dev-kits/master/launch.toml">
